@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>ManualCam</title>
+<style>
+  :root { --bg:#0b0c0d; --panel:rgba(14,15,17,.72); --fg:#f2f1ec; --dim:#8d9096; --amber:#ffb300; --line:rgba(255,255,255,.14); color-scheme:dark; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; margin:0; background:var(--bg); color:var(--fg); overflow:hidden;
+    font:14px/1.4 -apple-system,"Hiragino Sans",system-ui,sans-serif; }
+  video { position:fixed; inset:0; width:100%; height:100%; object-fit:contain; background:#000; }
+  .mono { font-family:ui-monospace,"SF Mono",Menlo,monospace; font-variant-numeric:tabular-nums; }
+  #hud { position:fixed; top:0; left:0; right:0; display:grid; grid-template-columns:repeat(4,1fr); gap:6px;
+    padding:calc(env(safe-area-inset-top,0px) + 8px) 12px 8px; }
+  #hud div { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:5px 4px; text-align:center; min-width:0; }
+  #hud small { display:block; color:var(--amber); font-size:10px; letter-spacing:.12em; }
+  #hud b { font-weight:500; font-size:15px; white-space:nowrap; }
+  #msg { position:fixed; top:calc(env(safe-area-inset-top,0px) + 72px); left:16px; right:16px; text-align:center;
+    background:var(--panel); border-radius:8px; padding:8px 12px; font-size:13px; }
+  #panel { position:fixed; left:0; right:0; bottom:0; background:var(--panel); border-top:1px solid var(--line);
+    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+    padding:10px 16px calc(env(safe-area-inset-bottom,0px) + 10px); display:flex; flex-direction:column; gap:8px; }
+  .toggles { display:flex; gap:8px; }
+  .toggles button { flex:1; padding:8px; border-radius:6px; border:1px solid var(--line); background:transparent; color:var(--fg); font:inherit; }
+  .toggles button[aria-pressed="true"] { background:var(--amber); color:#111; border-color:var(--amber); font-weight:600; }
+  .toggles button:disabled { opacity:.35; }
+  .row { display:grid; grid-template-columns:52px 1fr 72px; align-items:center; gap:8px; }
+  .row label { color:var(--dim); font-size:12px; }
+  .row output { text-align:right; font-size:13px; }
+  .row.off { opacity:.4; }
+  .row .na { grid-column:2 / 4; color:var(--dim); font-size:12px; }
+  input[type=range] { width:100%; accent-color:var(--amber); height:28px; margin:0; }
+  #shutter { align-self:center; width:66px; height:66px; border-radius:50%; border:4px solid var(--fg); background:transparent; padding:3px; }
+  #shutter::after { content:""; display:block; width:100%; height:100%; border-radius:50%; background:var(--fg); }
+  #shutter:active::after { background:var(--amber); }
+  #start { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px;
+    background:var(--bg); padding:24px; text-align:center; }
+  #start h1 { margin:0; font-size:26px; letter-spacing:.08em; font-weight:600; }
+  #start p { margin:0; color:var(--dim); max-width:30em; }
+  #start button { padding:14px 28px; border-radius:8px; border:0; background:var(--amber); color:#111; font:600 16px/1 inherit; }
+  #shot { position:fixed; inset:0; background:rgba(0,0,0,.92); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:20px; }
+  #shot img { max-width:100%; max-height:70%; border:1px solid var(--line); }
+  #shot button { padding:10px 22px; border-radius:6px; border:1px solid var(--line); background:transparent; color:var(--fg); font:inherit; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<video id="v" playsinline autoplay muted></video>
+
+<div id="hud" class="mono">
+  <div><small>SS</small><b id="hSS">--</b></div>
+  <div><small>F</small><b id="hF">--</b></div>
+  <div><small>ISO</small><b id="hISO">--</b></div>
+  <div><small>FOCUS</small><b id="hFocus">--</b></div>
+</div>
+<div id="msg" hidden></div>
+
+<div id="panel" hidden>
+  <div class="toggles">
+    <button id="ae" aria-pressed="true">露出オート</button>
+    <button id="af" aria-pressed="true">AF</button>
+  </div>
+  <div id="rows"></div>
+  <button id="shutter" aria-label="撮影"></button>
+</div>
+
+<div id="shot" hidden>
+  <img id="shotImg" alt="撮影した写真">
+  <div>画像を長押しして「写真に保存」</div>
+  <button id="shotClose">閉じる</button>
+</div>
+
+<div id="start">
+  <h1>ManualCam</h1>
+  <p>SS・ISO・ピントを手動で操作します。Safariが対応していない項目は「非対応」と表示されます。</p>
+  <button id="go">カメラを起動</button>
+  <p id="startErr"></p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let track, caps = {};
+
+// 操作項目。exposureTime の単位は 100マイクロ秒（仕様）
+const CONTROLS = [
+  { key:'exposureTime', label:'SS', group:'ae', log:true,
+    fmt:v => { const s = v/10000; return s >= 1 ? s.toFixed(1)+'s' : '1/'+Math.round(1/s); } },
+  { key:'iso', label:'ISO', group:'ae', log:true, fmt:v => String(Math.round(v)) },
+  { key:'exposureCompensation', label:'露出補正', group:null, fmt:v => (v>0?'+':'')+v.toFixed(1)+'EV' },
+  { key:'focusDistance', label:'ピント', group:'af', fmt:v => v.toFixed(2)+'m' },
+  { key:'zoom', label:'ズーム', group:null, fmt:v => v.toFixed(1)+'x' },
+];
+const auto = { ae:true, af:true };
+
+function say(text, ms) {
+  $('msg').textContent = text; $('msg').hidden = false;
+  clearTimeout(say.t); if (ms) say.t = setTimeout(() => $('msg').hidden = true, ms);
+}
+
+async function apply(c) {
+  try { await track.applyConstraints({ advanced:[c] }); }
+  catch (e) { say('設定できませんでした: ' + (e.message || e.name), 2500); }
+}
+
+function supported(c) {
+  const r = caps[c.key];
+  return r && typeof r.min === 'number' && r.max > r.min;
+}
+
+// スライダー位置(0..1000) ⇔ 実際の値
+function toValue(c, t) {
+  const r = caps[c.key], p = t/1000;
+  let v = (c.log && r.min > 0) ? r.min * Math.pow(r.max/r.min, p) : r.min + (r.max-r.min)*p;
+  if (r.step) v = Math.round(v/r.step)*r.step;
+  return Math.min(r.max, Math.max(r.min, v));
+}
+function toPos(c, v) {
+  const r = caps[c.key];
+  const p = (c.log && r.min > 0) ? Math.log(v/r.min)/Math.log(r.max/r.min) : (v-r.min)/(r.max-r.min);
+  return Math.round(Math.min(1, Math.max(0, p))*1000);
+}
+
+function buildRows() {
+  const rows = $('rows'); rows.innerHTML = '';
+  rows.style.cssText = 'display:flex;flex-direction:column;gap:4px';
+  for (const c of CONTROLS) {
+    const row = document.createElement('div'); row.className = 'row'; row.id = 'row-'+c.key;
+    const label = document.createElement('label'); label.textContent = c.label; label.htmlFor = 'in-'+c.key;
+    row.append(label);
+    if (supported(c)) {
+      const input = document.createElement('input'); input.type = 'range'; input.id = 'in-'+c.key;
+      input.min = 0; input.max = 1000; input.step = 1;
+      const out = document.createElement('output'); out.className = 'mono'; out.id = 'out-'+c.key;
+      input.addEventListener('input', () => {
+        const v = toValue(c, +input.value); out.textContent = c.fmt(v);
+        const con = { [c.key]: v };
+        if (c.group === 'ae') con.exposureMode = 'manual';
+        if (c.group === 'af') con.focusMode = 'manual';
+        apply(con);
+      });
+      row.append(input, out);
+    } else {
+      const na = document.createElement('span'); na.className = 'na'; na.textContent = 'Safari非対応';
+      row.append(na);
+    }
+    rows.append(row);
+  }
+  // 絞り: Webには絞りを操作・取得する仕組みがない
+  const ap = document.createElement('div'); ap.className = 'row';
+  ap.innerHTML = '<label>絞り</label><span class="na">Webからは操作・取得できません</span>';
+  rows.append(ap);
+}
+
+function syncAuto() {
+  for (const g of ['ae','af']) {
+    $(g).setAttribute('aria-pressed', auto[g]);
+    for (const c of CONTROLS.filter(c => c.group === g)) {
+      const row = $('row-'+c.key), input = $('in-'+c.key);
+      if (input) { input.disabled = auto[g]; row.classList.toggle('off', auto[g]); }
+    }
+  }
+}
+
+function hasMode(key, mode) { return Array.isArray(caps[key]) && caps[key].includes(mode); }
+
+function setAuto(g, on) {
+  auto[g] = on;
+  const key = g === 'ae' ? 'exposureMode' : 'focusMode';
+  const s = track.getSettings();
+  if (on) {
+    apply({ [key]:'continuous' });
+  } else {
+    // 今の値からマニュアルを始める
+    const con = { [key]:'manual' };
+    for (const c of CONTROLS.filter(c => c.group === g && supported(c))) {
+      const v = typeof s[c.key] === 'number' ? s[c.key] : toValue(c, 500);
+      $('in-'+c.key).value = toPos(c, v); $('out-'+c.key).textContent = c.fmt(v);
+      con[c.key] = v;
+    }
+    apply(con);
+  }
+  syncAuto();
+}
+
+function refresh() {
+  if (!track) return;
+  const s = track.getSettings();
+  $('hSS').textContent = typeof s.exposureTime === 'number' ? CONTROLS[0].fmt(s.exposureTime) : '--';
+  $('hISO').textContent = typeof s.iso === 'number' ? Math.round(s.iso) : '--';
+  $('hFocus').textContent = typeof s.focusDistance === 'number' ? s.focusDistance.toFixed(2)+'m' : (s.focusMode === 'manual' ? 'MF' : 'AF');
+  $('hF').textContent = '--';
+  for (const c of CONTROLS) {
+    const input = $('in-'+c.key); if (!input || typeof s[c.key] !== 'number') continue;
+    if (c.group && !auto[c.group]) continue;         // マニュアル中は指の操作を優先
+    if (document.activeElement === input) continue;
+    input.value = toPos(c, s[c.key]); $('out-'+c.key).textContent = c.fmt(s[c.key]);
+  }
+}
+
+async function start() {
+  $('startErr').textContent = '';
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('startErr').textContent = 'このページではカメラを使えません。https:// のURLをSafariで開いてください。';
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio:false,
+      video:{ facingMode:{ ideal:'environment' }, width:{ ideal:4032 }, height:{ ideal:3024 } }
+    });
+    $('v').srcObject = stream;
+    track = stream.getVideoTracks()[0];
+    caps = track.getCapabilities ? track.getCapabilities() : {};
+  } catch (e) {
+    $('startErr').textContent = e.name === 'NotAllowedError'
+      ? 'カメラが許可されていません。Safariの「ぁあ」→ Webサイトの設定 → カメラを「許可」にしてください。'
+      : 'カメラを起動できませんでした: ' + (e.message || e.name);
+    return;
+  }
+  $('start').hidden = true; $('panel').hidden = false;
+  buildRows();
+  $('ae').disabled = !hasMode('exposureMode','manual') || !CONTROLS.some(c => c.group==='ae' && supported(c));
+  $('af').disabled = !hasMode('focusMode','manual') || !supported(CONTROLS[3]);
+  syncAuto();
+  setInterval(refresh, 300); refresh();
+  const n = CONTROLS.filter(supported).length;
+  if (!n) say('このSafariは手動操作に対応していません。プレビューと撮影のみ使えます。', 6000);
+}
+
+async function capture() {
+  const v = $('v'); if (!v.videoWidth) return;
+  const cv = document.createElement('canvas'); cv.width = v.videoWidth; cv.height = v.videoHeight;
+  cv.getContext('2d').drawImage(v, 0, 0);
+  const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.95));
+  if (!blob) { say('撮影に失敗しました', 2500); return; }
+  const file = new File([blob], 'manualcam-' + Date.now() + '.jpg', { type:'image/jpeg' });
+  if (navigator.canShare && navigator.canShare({ files:[file] })) {
+    try { await navigator.share({ files:[file] }); return; }   // 共有シート →「画像を保存」
+    catch (e) { if (e.name === 'AbortError') return; }
+  }
+  $('shotImg').src = URL.createObjectURL(blob); $('shot').hidden = false;
+}
+
+$('go').addEventListener('click', start);
+$('ae').addEventListener('click', () => setAuto('ae', !auto.ae));
+$('af').addEventListener('click', () => setAuto('af', !auto.af));
+$('shutter').addEventListener('click', capture);
+$('shotClose').addEventListener('click', () => { URL.revokeObjectURL($('shotImg').src); $('shot').hidden = true; });
+</script>
+</body>
+</html>
